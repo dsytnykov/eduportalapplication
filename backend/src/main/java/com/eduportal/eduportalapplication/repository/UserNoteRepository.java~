@@ -1,0 +1,4 @@
+package com.eduportal.eduportalapplication.repository;
+
+public class UserNoteRepository {
+}

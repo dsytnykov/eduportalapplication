@@ -1,0 +1,290 @@
+package com.eduportal.eduportalapplication.service;
+
+import com.contentful.java.cda.CDAEntry;
+import com.eduportal.eduportalapplication.dto.CourseDto;
+import com.eduportal.eduportalapplication.dto.LessonDto;
+import com.eduportal.eduportalapplication.dto.SectionDto;
+import com.eduportal.eduportalapplication.dto.SectionProgressDto;
+import com.eduportal.eduportalapplication.exception.ResourceNotFoundException;
+import com.eduportal.eduportalapplication.model.CourseReference;
+import com.eduportal.eduportalapplication.model.LessonReference;
+import com.eduportal.eduportalapplication.model.SectionReference;
+import com.eduportal.eduportalapplication.model.Tag;
+import com.eduportal.eduportalapplication.repository.CourseReferenceRepository;
+import com.eduportal.eduportalapplication.repository.LessonReferenceRepository;
+import com.eduportal.eduportalapplication.repository.SectionReferenceRepository;
+import com.eduportal.eduportalapplication.repository.TagRepository;
+import com.fasterxml.jackson.databind.JsonNode;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class CourseService {
+
+    private final CourseReferenceRepository courseRepository;
+    private final SectionReferenceRepository sectionRepository;
+    private final LessonReferenceRepository lessonRepository;
+    private final TagRepository tagRepository;
+    private final ContentfulService contentfulService;
+    private final FirebaseService firebaseService;
+
+    public List<CourseDto> getAllPublishedCourses() {
+        List<CourseReference> courses = courseRepository.findByPublishedTrue();
+        return courses.stream()
+                .map(this::mapCourseReferenceToDto)
+                .collect(Collectors.toList());
+    }
+
+    public List<CourseDto> getFeaturedCourses() {
+        List<CourseReference> courses = courseRepository.findByPublishedTrueAndFeaturedTrue();
+        return courses.stream()
+                .map(this::mapCourseReferenceToDto)
+                .collect(Collectors.toList());
+    }
+
+    public CourseDto getCourseById(UUID id, String userId) {
+        CourseReference courseRef = courseRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Course", "id", id));
+
+        CourseDto courseDto = mapCourseReferenceToDto(courseRef);
+
+        if (userId != null) {
+            try {
+                CompletableFuture<CourseDto> futureCourse = CompletableFuture.completedFuture(courseDto);
+                CompletableFuture<CourseDto> withProgress = futureCourse
+                        .thenCompose(course -> firebaseService.getUserCourseProgress(userId, id.toString())
+                                .thenApply(progress -> {
+                                    course.setCompletedSections(progress.getCompletedSections());
+                                    course.setTotalSections(progress.getTotalSections());
+
+                                    if (progress.getSectionProgresses() != null && course.getSections() != null) {
+                                        for (SectionDto sectionDto : course.getSections()) {
+                                            SectionProgressDto sectionProgress =
+                                                    progress.getSectionProgresses().get(sectionDto.getId().toString());
+                                            if (sectionProgress != null) {
+                                                sectionDto.setCompleted(sectionProgress.isCompleted());
+                                            }
+                                        }
+                                    }
+
+                                    return course;
+                                }));
+
+                return withProgress.join();
+            } catch (Exception e) {
+                log.error("Error fetching course progress", e);
+                return courseDto;
+            }
+        }
+
+        return courseDto;
+    }
+
+    public SectionDto getSectionById(UUID sectionId, String userId) {
+        SectionReference sectionRef = sectionRepository.findById(sectionId)
+                .orElseThrow(() -> new ResourceNotFoundException("Section", "id", sectionId));
+
+        CDAEntry sectionEntry = contentfulService.getSection(sectionRef.getContentfulId());
+
+        SectionDto sectionDto = mapSectionReferenceToDto(sectionRef);
+        sectionDto.setContent(contentfulService.getEntryContent(sectionEntry, "content"));
+
+        boolean isSectionCompleted = false;
+        if (userId != null) {
+            try {
+                UUID courseId = sectionRef.getCourse().getId();
+                isSectionCompleted = firebaseService.isSectionCompleted(
+                                userId, courseId.toString(), sectionId.toString())
+                        .join();
+                sectionDto.setCompleted(isSectionCompleted);
+            } catch (Exception e) {
+                sectionDto.setCompleted(false);
+                log.error("Error checking section completion", e);
+            }
+        }
+        List<LessonReference> lessonRefs = lessonRepository.findBySectionIdOrderByOrderIndexAsc(sectionId);
+        List<LessonDto> lessonDtos = new ArrayList<>();
+
+        for (LessonReference lessonRef : lessonRefs) {
+            LessonDto lessonDto = mapLessonReferenceToDto(lessonRef);
+            if (userId != null) {
+                lessonDto.setCompleted(isSectionCompleted);
+            }
+            lessonDtos.add(lessonDto);
+        }
+        sectionDto.setLessons(lessonDtos);
+        addSectionNavigation(sectionDto, sectionRef);
+        return sectionDto;
+    }
+
+    private void addSectionNavigation(SectionDto sectionDto, SectionReference sectionRef) {
+        CourseReference courseRef = sectionRef.getCourse();
+        List<SectionReference> orderedSections = new ArrayList<>(courseRef.getSectionReferences());
+        orderedSections.sort(Comparator.comparing(SectionReference::getOrderIndex));
+
+        int currentIndex = -1;
+        for (int i = 0; i < orderedSections.size(); i++) {
+            if (orderedSections.get(i).getId().equals(sectionRef.getId())) {
+                currentIndex = i;
+                break;
+            }
+        }
+
+        if (currentIndex != -1) {
+            if (currentIndex > 0) {
+                SectionReference prevSection = orderedSections.get(currentIndex - 1);
+                sectionDto.setPrevSection(new SectionDto.SectionNavigation(
+                        prevSection.getId(),
+                        prevSection.getTitle()
+                ));
+            }
+
+            if (currentIndex < orderedSections.size() - 1) {
+                SectionReference nextSection = orderedSections.get(currentIndex + 1);
+                sectionDto.setNextSection(new SectionDto.SectionNavigation(
+                        nextSection.getId(),
+                        nextSection.getTitle()
+                ));
+            }
+        }
+    }
+
+    public LessonDto getLessonById(UUID lessonId, String userId) {
+        LessonReference lessonRef = lessonRepository.findById(lessonId)
+                .orElseThrow(() -> new ResourceNotFoundException("Lesson", "id", lessonId));
+
+        CDAEntry lessonEntry = contentfulService.getLesson(lessonRef.getContentfulId());
+
+        LessonDto lessonDto = mapLessonReferenceToDto(lessonRef);
+        lessonDto.setContent(contentfulService.getEntryContent(lessonEntry, "content"));
+
+        if (userId != null) {
+            try {
+                UUID courseId = lessonRef.getSection().getCourse().getId();
+                UUID sectionId = lessonRef.getSection().getId();
+                Boolean sectionCompleted = firebaseService.isSectionCompleted(
+                                userId, courseId.toString(), sectionId.toString())
+                        .join();
+                lessonDto.setCompleted(sectionCompleted);
+            } catch (Exception e) {
+                lessonDto.setCompleted(false);
+                log.error("Error checking section completion for lesson", e);
+            }
+        }
+        addLessonNavigation(lessonDto, lessonRef);
+        return lessonDto;
+    }
+
+    public List<CourseDto> getCoursesByTag(String tagName) {
+        List<CourseReference> courses = courseRepository.findPublishedCoursesByTagName(tagName);
+        return courses.stream()
+                .map(this::mapCourseReferenceToDto)
+                .collect(Collectors.toList());
+    }
+
+    private CourseDto mapCourseReferenceToDto(CourseReference courseRef) {
+        CDAEntry courseEntry = contentfulService.getCourse(courseRef.getContentfulId());
+
+        List<SectionDto> sectionsDto = courseRef.getSectionReferences().stream()
+                .sorted(Comparator.comparing(SectionReference::getOrderIndex))
+                .map(this::mapSectionReferenceToDto)
+                .collect(Collectors.toList());
+
+        Set<String> tagNames = courseRef.getTags().stream()
+                .map(Tag::getName)
+                .collect(Collectors.toSet());
+
+        CourseDto dto = CourseDto.builder()
+                .id(courseRef.getId())
+                .contentfulId(courseRef.getContentfulId())
+                .title(courseRef.getTitle())
+                .published(courseRef.isPublished())
+                .featured(courseRef.isFeatured())
+                .createdAt(courseRef.getCreatedAt())
+                .updatedAt(courseRef.getUpdatedAt())
+                .tags(tagNames)
+                .sections(sectionsDto)
+                .totalSections(courseRef.getSectionReferences().size())
+                .content(extractRichTextContent(courseEntry.getField("content")))
+                .build();
+
+        dto.setDescription(courseEntry.getField("description"));
+        dto.setContent(contentfulService.getEntryContent(courseEntry, "content"));
+        return dto;
+    }
+
+    private JsonNode extractRichTextContent(Object contentField) {
+        if (contentField == null) return null;
+
+        if (contentField instanceof JsonNode jsonNode) {
+            if (jsonNode.has("en-US")) {
+                return jsonNode.get("en-US");
+            }
+            return jsonNode;
+        }
+        return null;
+    }
+
+    private SectionDto mapSectionReferenceToDto(SectionReference sectionRef) {
+        return SectionDto.builder()
+                .id(sectionRef.getId())
+                .contentfulId(sectionRef.getContentfulId())
+                .title(sectionRef.getTitle())
+                .orderIndex(sectionRef.getOrderIndex())
+                .createdAt(sectionRef.getCreatedAt())
+                .courseId(sectionRef.getCourse().getId())
+                .lessons(sectionRef.getLessonReferences().stream()
+                        .sorted(Comparator.comparing(LessonReference::getOrderIndex))
+                        .map(this::mapLessonReferenceToDto)
+                        .collect(Collectors.toList()))
+                .completed(false)
+                .build();
+    }
+
+    private LessonDto mapLessonReferenceToDto(LessonReference lessonRef) {
+        return LessonDto.builder()
+                .id(lessonRef.getId())
+                .contentfulId(lessonRef.getContentfulId())
+                .title(lessonRef.getTitle())
+                .orderIndex(lessonRef.getOrderIndex())
+                .createdAt(lessonRef.getCreatedAt())
+                .sectionId(lessonRef.getSection().getId())
+                .completed(false)
+                .build();
+    }
+
+    private void addLessonNavigation(LessonDto lessonDto, LessonReference lessonRef) {
+        Optional<LessonReference> nextLessonOpt = lessonRepository.findNextLesson(
+                lessonRef.getSection().getId(), lessonRef.getOrderIndex());
+
+        if (nextLessonOpt.isPresent()) {
+            LessonReference nextLesson = nextLessonOpt.get();
+            lessonDto.setNextLesson(new LessonDto.LessonNavigation(nextLesson.getId(), nextLesson.getTitle()));
+        }
+
+        Optional<LessonReference> prevLessonOpt = lessonRepository.findPreviousLesson(
+                lessonRef.getSection().getId(), lessonRef.getOrderIndex());
+
+        if (prevLessonOpt.isPresent()) {
+            LessonReference prevLesson = prevLessonOpt.get();
+            lessonDto.setPrevLesson(new LessonDto.LessonNavigation(prevLesson.getId(), prevLesson.getTitle()));
+        }
+    }
+
+    private int calculateTotalLessons(CourseReference courseRef) {
+        int total = 0;
+        Set<SectionReference> sections = new HashSet<>(courseRef.getSectionReferences());
+        for (SectionReference section : sections) {
+            total += section.getLessonReferences().size();
+        }
+        return total;
+    }
+}
+
